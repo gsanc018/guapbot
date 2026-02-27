@@ -93,7 +93,7 @@ class TestKrakenClient:
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 5
         assert list(df.columns) == ["open", "high", "low", "close", "volume", "trades"]
-        assert df.index.tz is not None  # UTC-aware
+        assert isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None  # UTC-aware
         assert df.index.is_monotonic_increasing
 
     def test_get_ohlc_invalid_interval_raises(self) -> None:
@@ -153,7 +153,7 @@ class TestParquetStore:
         tmp_store.save("XBTUSD", "1h", original)
         loaded = tmp_store.load("XBTUSD", "1h")
         assert len(loaded) == 100
-        assert loaded.index.tz is not None
+        assert isinstance(loaded.index, pd.DatetimeIndex) and loaded.index.tz is not None
 
     def test_append_adds_new_bars(self, tmp_store: ParquetStore) -> None:
         first_batch = make_ohlc_df(10, start="2024-01-01")        # 00:00 – 09:00
