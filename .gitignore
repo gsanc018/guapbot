@@ -1,0 +1,56 @@
+# Secrets and environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Data (never commit)
+data/
+*.parquet
+*.zip
+*.csv.gz
+
+# Models (never commit)
+models/
+*.pt
+*.pkl
+*.pth
+*.onnx
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Notebooks output (keep notebooks, not output)
+notebooks/*.html
