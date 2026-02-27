@@ -28,14 +28,14 @@ except ImportError:
 
 def _float(val: str | None, default: float) -> float:
     try:
-        return float(val)
+        return float(val) if val is not None else default
     except (ValueError, AttributeError, TypeError):
         return default
 
 
 def _int(val: str | None, default: int) -> int:
     try:
-        return int(val)
+        return int(val) if val is not None else default
     except (ValueError, AttributeError, TypeError):
         return default
 
@@ -43,6 +43,11 @@ def _int(val: str | None, default: int) -> int:
 @dataclass
 class Settings:
     """All GuapBot configuration, sourced from environment / .env file."""
+
+    # Paths 
+    data_cache_dir: Path = Path("data/cache")
+    models_dir: Path = Path("models")
+    logs_dir: Path = Path("logs")
 
     # Kraken
     kraken_api_key: str = field(default_factory=lambda: os.getenv("KRAKEN_API_KEY", ""))
