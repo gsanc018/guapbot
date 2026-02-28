@@ -1,0 +1,16 @@
+# configs/sat_stacker.yaml
+# sat_stacker strategy configuration — BTC-base, accumulate satoshis.
+
+pair: ETHUSD
+strategy: sat_stacker
+
+# Position sizing caps — long-only (stacking sats, not shorting)
+max_long: 0.20    # max 20% of portfolio long
+max_short: 0.00   # no shorting: when bearish, go flat (stablecoin = cash)
+
+# Trading costs
+fee_rate: 0.0026  # 0.26% taker fee (Kraken)
+
+# Kill switches (per-strategy, evaluated independently of portfolio-level)
+daily_dd_limit: -0.05   # -5%
+total_dd_limit: -0.15   # -15%

@@ -16,6 +16,7 @@ from guapbot.cli.data_commands import data_app
 from guapbot.cli.features_commands import features_app
 from guapbot.cli.model_commands import model_app
 from guapbot.cli.paper_commands import paper_app
+from guapbot.cli.portfolio_commands import portfolio_app
 
 app = typer.Typer(
     name="guapbot",
@@ -30,6 +31,7 @@ app.add_typer(features_app, name="features")
 app.add_typer(model_app, name="models")
 app.add_typer(backtest_app, name="backtest")
 app.add_typer(paper_app, name="paper")
+app.add_typer(portfolio_app, name="portfolio")
 
 
 @app.command("train")
