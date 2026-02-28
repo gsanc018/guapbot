@@ -22,8 +22,8 @@ env/
 *.zip
 *.csv.gz
 
-# Models (never commit)
-models/
+# Models (never commit trained artifacts)
+/models/
 *.pt
 *.pkl
 *.pth

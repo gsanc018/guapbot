@@ -119,7 +119,10 @@ def fetch(
     console.print(f"Fetching {pair.upper()} {interval}...")
     try:
         df = manager.fetch(pair.upper(), interval)
-        console.print(f"[green]✓[/green] {len(df):,} bars total (up to {df.index[-1]})")
+        if df.empty:
+            console.print("[yellow]No cached data found. Run guapbot data download first.[/yellow]")
+        else:
+            console.print(f"[green]✓[/green] {len(df):,} bars total (up to {df.index[-1]})")
     except Exception as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1)
