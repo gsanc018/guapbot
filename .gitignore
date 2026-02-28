@@ -16,8 +16,8 @@ build/
 venv/
 env/
 
-# Data (never commit)
-data/
+# Data (never commit raw data / cache — code lives in guapbot/data/)
+/data/
 *.parquet
 *.zip
 *.csv.gz

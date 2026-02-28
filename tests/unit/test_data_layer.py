@@ -8,13 +8,13 @@ Run with: pytest tests/unit/test_data_layer.py -v
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
+from guapbot.data.aggregator import aggregate_trades_to_ohlcv, rows_to_tick_df
 from guapbot.data.kraken_client import KrakenClient, KrakenRESTError
 from guapbot.data.store import ParquetStore
 from guapbot.data.manager import DataManager
@@ -48,9 +48,8 @@ def tmp_store(tmp_path: Path) -> ParquetStore:
 
 @pytest.fixture
 def mock_client() -> MagicMock:
-    """KrakenClient with mocked get_ohlc."""
+    """KrakenClient with mocked public methods."""
     client = MagicMock(spec=KrakenClient)
-    client.get_ohlc.return_value = (make_ohlc_df(50), 1234567890)
     client.get_ticker.return_value = {"ask": 50100.0, "bid": 49900.0, "last": 50000.0, "volume_24h": 1234.0}
     return client
 
@@ -65,54 +64,6 @@ def manager(mock_client: MagicMock, tmp_store: ParquetStore) -> DataManager:
 # ------------------------------------------------------------------
 
 class TestKrakenClient:
-    def test_get_ohlc_parses_response(self) -> None:
-        """KrakenClient.get_ohlc should return a properly shaped DataFrame."""
-        client = KrakenClient()
-        # Build a fake Kraken OHLC response
-        now = int(time.time())
-        fake_bars = [
-            [now - 3600 * i, "50000", "50100", "49900", "50050", "50025", "1.5", 100]
-            for i in range(5, 0, -1)
-        ]
-        fake_response = {
-            "result": {
-                "XXBTZUSD": fake_bars,
-                "last": now,
-            },
-            "error": [],
-        }
-
-        with patch.object(client._session, "get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = fake_response
-            mock_resp.raise_for_status.return_value = None
-            mock_get.return_value = mock_resp
-
-            df, last_cursor = client.get_ohlc("XBTUSD", "1h")
-
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) == 5
-        assert list(df.columns) == ["open", "high", "low", "close", "volume", "trades"]
-        assert isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None  # UTC-aware
-        assert df.index.is_monotonic_increasing
-        assert last_cursor == now
-
-    def test_get_ohlc_invalid_interval_raises(self) -> None:
-        client = KrakenClient()
-        with pytest.raises(ValueError, match="Unknown interval"):
-            client.get_ohlc("XBTUSD", "5m")
-
-    def test_get_ohlc_api_error_raises(self) -> None:
-        client = KrakenClient()
-        with patch.object(client._session, "get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = {"result": {}, "error": ["EGeneral:Invalid arguments"]}
-            mock_resp.raise_for_status.return_value = None
-            mock_get.return_value = mock_resp
-
-            with pytest.raises(KrakenRESTError):
-                client.get_ohlc("XBTUSD", "1h")
-
     def test_get_ticker_parses_response(self) -> None:
         client = KrakenClient()
         fake_response = {
@@ -195,45 +146,92 @@ class TestParquetStore:
         tmp_store.clear("XBTUSD", "1h")
         assert tmp_store.last_timestamp("XBTUSD", "1h") is None
 
+    # ------------------------------------------------------------------
+    # Validation tests
+    # ------------------------------------------------------------------
+
+    def test_zero_volume_bars_dropped(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10).copy()
+        df["volume"] = df["volume"].where(~df.index.isin(df.index[2:4]), 0.0)
+        tmp_store.save("XBTUSD", "1h", df)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 8
+        assert (loaded["volume"] > 0).all()
+
+    def test_negative_volume_bars_dropped(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10).copy()
+        df["volume"] = df["volume"].where(df.index != df.index[0], -1.0)
+        tmp_store.save("XBTUSD", "1h", df)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 9
+
+    def test_ohlc_high_below_low_dropped(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10).copy()
+        # Swap high and low on bar 5 so high < low
+        df["high"] = df["high"].where(df.index != df.index[5], 49000.0)
+        df["low"] = df["low"].where(df.index != df.index[5], 51000.0)
+        tmp_store.save("XBTUSD", "1h", df)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 9
+
+    def test_negative_price_dropped(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10).copy()
+        df["close"] = df["close"].where(df.index != df.index[0], -1.0)
+        tmp_store.save("XBTUSD", "1h", df)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 9
+
+    def test_nan_ohlcv_dropped(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10).copy()
+        df["close"] = df["close"].where(df.index != df.index[3], float("nan"))
+        tmp_store.save("XBTUSD", "1h", df)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 9
+        assert loaded["close"].notna().all()
+
+    def test_duplicate_timestamps_deduplicated(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10)
+        df_with_dupe = pd.concat([df, df.iloc[[3]]])   # row 3 duplicated
+        tmp_store.save("XBTUSD", "1h", df_with_dupe)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 10
+        assert loaded.index.is_unique
+
+    def test_non_monotonic_index_sorted(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(10)
+        df_shuffled = df.sample(frac=1, random_state=42)   # random order
+        tmp_store.save("XBTUSD", "1h", df_shuffled)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert loaded.index.is_monotonic_increasing
+
+    def test_valid_data_passes_through_unchanged(self, tmp_store: ParquetStore) -> None:
+        df = make_ohlc_df(20)
+        tmp_store.save("XBTUSD", "1h", df)
+        loaded = tmp_store.load("XBTUSD", "1h")
+        assert len(loaded) == 20
+
 
 # ------------------------------------------------------------------
 # DataManager tests
 # ------------------------------------------------------------------
 
 class TestDataManager:
-    def test_fetch_triggers_full_history_when_no_cache(
-        self, manager: DataManager, mock_client: MagicMock
+    def test_fetch_returns_empty_when_no_cache(
+        self, manager: DataManager
     ) -> None:
-        """First fetch on empty cache should call get_ohlc multiple times (backfill)."""
-        # Make client return empty eventually to stop the loop
-        call_count = 0
-        def side_effect(pair, interval, since=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count > 2:
-                return pd.DataFrame(), since or 0
-            next_cursor = (since or 0) + 1
-            return make_ohlc_df(50, start="2024-01-01"), next_cursor
-
-        mock_client.get_ohlc.side_effect = side_effect
+        """fetch() with no cached data returns an empty DataFrame (no live API call)."""
         df = manager.fetch("XBTUSD", "1h")
-        assert not df.empty
+        assert df.empty
 
-    def test_fetch_incremental_on_existing_cache(
-        self, manager: DataManager, mock_client: MagicMock, tmp_store: ParquetStore
+    def test_fetch_returns_cached_data(
+        self, manager: DataManager, tmp_store: ParquetStore
     ) -> None:
-        """Second fetch should only request new bars since last cached timestamp."""
-        # Pre-populate cache
+        """fetch() returns whatever is in the cache without making API calls."""
         existing = make_ohlc_df(100, start="2024-01-01")
         tmp_store.save("XBTUSD", "1h", existing)
 
-        # Fetch should now do incremental — single call with since set
-        new_bars = make_ohlc_df(5, start="2024-01-05 04:00")
-        mock_client.get_ohlc.return_value = (new_bars, 1234567890)
-
         df = manager.fetch("XBTUSD", "1h")
-        call_args = mock_client.get_ohlc.call_args
-        assert call_args.kwargs.get("since") is not None or call_args.args[2] is not None
+        assert len(df) == 100
 
     def test_latest_price_calls_ticker(
         self, manager: DataManager, mock_client: MagicMock
@@ -262,3 +260,170 @@ class TestDataManager:
         tmp_store.save("XBTUSD", "1h", make_ohlc_df(10))
         info = manager.cache_info()
         assert "XBTUSD_1h" in info
+
+    def test_backfill_trades_paginates_and_saves(
+        self, manager: DataManager, mock_client: MagicMock, tmp_store: ParquetStore
+    ) -> None:
+        """backfill_trades() paginates until cursor stalls, aggregates, and saves."""
+        # Build synthetic tick rows: [price, volume, time, side, type, misc, trade_id]
+        import time as time_mod
+        base_ts = int(pd.Timestamp("2026-01-01", tz="UTC").timestamp())
+        # 120 trades spread across 2 hours so we get ≥2 1h bars
+        tick_rows = [
+            [str(50000 + i), str(0.01), base_ts + i * 60, "b", "m", "", i]
+            for i in range(120)
+        ]
+        # First call returns 120 rows, cursor advances; second call stalls
+        call_count = 0
+        def get_trades_side_effect(pair, since=0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return tick_rows, base_ts + 120 * 60  # cursor advanced
+            # Stall: last == since
+            stall_cursor = base_ts + 120 * 60
+            return [], stall_cursor
+
+        mock_client.get_trades.side_effect = get_trades_side_effect
+
+        results = manager.backfill_trades(pair="XBTUSD", since=0)
+
+        assert "1h" in results
+        assert len(results["1h"]) >= 1
+        assert call_count == 2  # paginated exactly twice
+
+    def test_backfill_trades_empty_response_returns_empty(
+        self, manager: DataManager, mock_client: MagicMock
+    ) -> None:
+        """backfill_trades() returns {} when the API returns no trades."""
+        mock_client.get_trades.return_value = ([], 0)
+        results = manager.backfill_trades(pair="XBTUSD", since=0)
+        assert results == {}
+
+    def test_backfill_trades_unknown_pair_raises(self, manager: DataManager) -> None:
+        with pytest.raises(ValueError, match="Unknown pair"):
+            manager.backfill_trades(pair="DOGEUSD")
+
+
+# ------------------------------------------------------------------
+# Aggregator tests
+# ------------------------------------------------------------------
+
+def make_tick_rows(n: int, base_ts: int, price: float = 50000.0) -> list:
+    """Build synthetic Kraken raw trade rows."""
+    return [
+        [str(price + i), str(0.01), float(base_ts + i * 60), "b", "m", "", i]
+        for i in range(n)
+    ]
+
+
+class TestAggregator:
+    def test_rows_to_tick_df_parses_kraken_format(self) -> None:
+        base_ts = int(pd.Timestamp("2026-01-01", tz="UTC").timestamp())
+        rows = make_tick_rows(5, base_ts)
+        df = rows_to_tick_df(rows)
+
+        assert list(df.columns) == ["price", "volume", "timestamp"]
+        assert df["price"].dtype == float
+        assert df["volume"].dtype == float
+        assert df["timestamp"].dt.tz is not None  # UTC-aware
+        assert len(df) == 5
+
+    def test_aggregate_1h_basic(self) -> None:
+        """120 trades spanning 2 hours → 2 1h bars."""
+        base_ts = int(pd.Timestamp("2026-01-01 00:00", tz="UTC").timestamp())
+        rows = make_tick_rows(120, base_ts)
+        ticks = rows_to_tick_df(rows)
+        bars = aggregate_trades_to_ohlcv(ticks, "1h")
+
+        assert len(bars) == 2
+        assert list(bars.columns) == ["open", "high", "low", "close", "volume", "trades"]
+        assert isinstance(bars.index, pd.DatetimeIndex)
+        assert bars.index.tz is not None
+        assert bars["trades"].dtype == int
+
+    def test_aggregate_4h_groups_bars(self) -> None:
+        """240 trades spanning 4 hours → 1 4h bar."""
+        base_ts = int(pd.Timestamp("2026-01-01 00:00", tz="UTC").timestamp())
+        rows = make_tick_rows(240, base_ts)
+        ticks = rows_to_tick_df(rows)
+        bars = aggregate_trades_to_ohlcv(ticks, "4h")
+
+        assert len(bars) == 1
+        assert bars.iloc[0]["volume"] == pytest.approx(240 * 0.01)
+        assert bars.iloc[0]["trades"] == 240
+
+    def test_aggregate_ohlc_values_correct(self) -> None:
+        """open/high/low/close should match first/max/min/last trade in the period."""
+        base_ts = int(pd.Timestamp("2026-01-01 00:00", tz="UTC").timestamp())
+        rows = [
+            ["50000", "1.0", float(base_ts + 0), "b", "m", "", 0],
+            ["50500", "1.0", float(base_ts + 100), "b", "m", "", 1],
+            ["49800", "1.0", float(base_ts + 200), "b", "m", "", 2],
+            ["50200", "1.0", float(base_ts + 300), "b", "m", "", 3],
+        ]
+        ticks = rows_to_tick_df(rows)
+        bars = aggregate_trades_to_ohlcv(ticks, "1h")
+
+        assert len(bars) == 1
+        bar = bars.iloc[0]
+        assert bar["open"] == pytest.approx(50000.0)
+        assert bar["high"] == pytest.approx(50500.0)
+        assert bar["low"] == pytest.approx(49800.0)
+        assert bar["close"] == pytest.approx(50200.0)
+
+    def test_aggregate_empty_returns_empty(self) -> None:
+        ticks = rows_to_tick_df([])
+        bars = aggregate_trades_to_ohlcv(ticks, "1h")
+        assert bars.empty
+        assert list(bars.columns) == ["open", "high", "low", "close", "volume", "trades"]
+
+    def test_aggregate_invalid_interval_raises(self) -> None:
+        base_ts = int(pd.Timestamp("2026-01-01", tz="UTC").timestamp())
+        ticks = rows_to_tick_df(make_tick_rows(5, base_ts))
+        with pytest.raises(ValueError, match="Unknown interval"):
+            aggregate_trades_to_ohlcv(ticks, "5m")
+
+
+# ------------------------------------------------------------------
+# KrakenClient.get_trades tests
+# ------------------------------------------------------------------
+
+class TestKrakenClientTrades:
+    def test_get_trades_parses_response(self) -> None:
+        """get_trades() should return (list_of_rows, int_cursor)."""
+        client = KrakenClient()
+        base_ts = int(pd.Timestamp("2026-01-01", tz="UTC").timestamp())
+        fake_rows = [
+            ["50000.00", "0.5", float(base_ts + i * 60), "b", "m", "", i]
+            for i in range(5)
+        ]
+        fake_last = str(base_ts * 1_000_000_000 + 9999)
+        fake_response = {
+            "result": {"XXBTZUSD": fake_rows, "last": fake_last},
+            "error": [],
+        }
+
+        with patch.object(client._session, "get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = fake_response
+            mock_resp.raise_for_status.return_value = None
+            mock_get.return_value = mock_resp
+
+            rows, last_cursor = client.get_trades("XBTUSD", since=0)
+
+        assert isinstance(rows, list)
+        assert len(rows) == 5
+        assert isinstance(last_cursor, int)
+        assert last_cursor == int(fake_last)
+
+    def test_get_trades_api_error_raises(self) -> None:
+        client = KrakenClient()
+        with patch.object(client._session, "get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"result": {}, "error": ["EGeneral:Invalid arguments"]}
+            mock_resp.raise_for_status.return_value = None
+            mock_get.return_value = mock_resp
+
+            with pytest.raises(KrakenRESTError):
+                client.get_trades("XBTUSD")

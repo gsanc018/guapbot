@@ -24,6 +24,7 @@ dependencies = [
     "numpy>=1.26.0",
 
     # ML / RL
+    "hmmlearn>=0.3.0",
     "torch>=2.1.0",
     "transformers>=4.36.0",
     "stable-baselines3>=2.2.0",
