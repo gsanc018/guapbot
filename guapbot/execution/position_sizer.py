@@ -139,8 +139,8 @@ class PositionSizer(ABC):
         max_long: float | None = None,
         max_short: float | None = None,
     ) -> None:
-        self.max_long = max_long or settings.max_long_fraction
-        self.max_short = max_short or settings.max_short_fraction
+        self.max_long = max_long if max_long is not None else settings.max_long_fraction
+        self.max_short = max_short if max_short is not None else settings.max_short_fraction
 
     # ------------------------------------------------------------------
     # Abstract interface — the one method that must be implemented
@@ -198,14 +198,21 @@ class PositionSizer(ABC):
         """
         Compute the half-Kelly fraction.
 
-        Kelly formula: f* = (win_rate / avg_loss) - ((1 - win_rate) / avg_win)
-        Half-Kelly:    f  = f* / 2
+        Standard binary Kelly: f* = p - q/b
+            p = win_rate
+            q = 1 - win_rate
+            b = avg_win / avg_loss  (win/loss odds ratio)
 
-        Returns a value in [0, 1]; returns 0 if Kelly is negative.
+        Expanding: f* = win_rate - (1 - win_rate) * avg_loss / avg_win
+
+        Example with typical inputs (win_rate=0.5, avg_win=0.02, avg_loss=0.01):
+            b = 2.0  →  f* = 0.5 - 0.25 = 0.25  →  half_kelly = 0.125  ✓
+
+        Returns a value in [0, 1]; returns 0 if Kelly is negative (no edge).
         """
         if avg_loss <= 0 or avg_win <= 0:
             return 0.5   # default neutral if no history
-        kelly = (win_rate / avg_loss) - ((1 - win_rate) / avg_win)
+        kelly = win_rate - (1.0 - win_rate) * avg_loss / avg_win
         half_kelly = kelly / 2.0
         return max(0.0, min(1.0, half_kelly))
 
@@ -214,3 +221,106 @@ class PositionSizer(ABC):
             f"{self.__class__.__name__}"
             f"(max_long={self.max_long:.0%}, max_short={self.max_short:.0%})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Concrete implementation
+# ---------------------------------------------------------------------------
+
+# ATR target: "normal" volatility level. Positions scale inversely around this.
+_ATR_TARGET = 0.02   # 2% ATR is considered baseline
+
+
+class DefaultPositionSizer(PositionSizer):
+    """
+    Concrete position sizer applying all 5 sizing layers in order.
+
+    Each layer can only reduce (never increase) the position magnitude:
+        1. Base signal       → signal × max_long/max_short
+        2. Kelly adjustment  → × half_kelly(win_rate, avg_win, avg_loss)
+        3. ATR adjustment    → × clip(atr_target / atr, 0.5, 1.0)
+        4. Regime adjustment → × mean confidence across all timeframes
+        5. Alert override    → cap at alert.max_position if active
+        6. Hard caps         → enforce max_long / max_short absolutely
+
+    Args:
+        max_long:  maximum long position fraction (default: settings.max_long_fraction)
+        max_short: maximum short position fraction (default: settings.max_short_fraction)
+        atr_target: ATR considered "normal" (default 0.02 = 2%)
+    """
+
+    def __init__(
+        self,
+        max_long: float | None = None,
+        max_short: float | None = None,
+        atr_target: float = _ATR_TARGET,
+    ) -> None:
+        super().__init__(max_long=max_long, max_short=max_short)
+        self._atr_target = atr_target
+
+    def size(
+        self,
+        signal: float,
+        regime: list[RegimeResult],
+        alert: AlertState,
+        *,
+        atr: float = 0.02,
+        win_rate: float = 0.5,
+        avg_win: float = 0.02,
+        avg_loss: float = 0.01,
+    ) -> SizingResult:
+        """Apply all sizing layers and return a full audit-trail SizingResult."""
+
+        # --- Layer 1: Base signal ---
+        if signal >= 0.0:
+            base = signal * self.max_long
+        else:
+            base = signal * self.max_short   # negative × positive = negative
+
+        # --- Layer 2: Kelly adjustment ---
+        kelly_scale = self._half_kelly(win_rate, avg_win, avg_loss)
+        after_kelly = base * kelly_scale
+
+        # --- Layer 3: ATR adjustment ---
+        if atr > 1e-8:
+            atr_scale = float(min(max(self._atr_target / atr, 0.5), 1.0))
+        else:
+            atr_scale = 1.0
+        after_atr = after_kelly * atr_scale
+
+        # --- Layer 4: Regime adjustment ---
+        if regime:
+            regime_conf = float(sum(r.confidence for r in regime) / len(regime))
+        else:
+            regime_conf = 1.0
+        after_regime = after_atr * regime_conf
+
+        # --- Layer 5: Alert override ---
+        if alert.active:
+            cap = alert.max_position
+            after_alert = max(-cap, min(cap, after_regime))
+            log.debug(
+                "Alert active — position capped: cap=%.4f before=%.4f after=%.4f",
+                cap, after_regime, after_alert,
+            )
+        else:
+            after_alert = after_regime
+
+        # --- Layer 6: Hard caps ---
+        final = self._apply_hard_caps(after_alert)
+
+        result = SizingResult(
+            position=final,
+            base_signal=base,
+            after_kelly=after_kelly,
+            after_atr=after_atr,
+            after_regime=after_regime,
+            after_alert=after_alert,
+            after_caps=final,
+        )
+        log.debug(
+            "PositionSizer: signal=%.4f kelly=%.3f atr_scale=%.3f regime_conf=%.3f alert=%s final=%.4f",
+            round(signal, 4), round(kelly_scale, 3), round(atr_scale, 3),
+            round(regime_conf, 3), alert.active, round(final, 4),
+        )
+        return result

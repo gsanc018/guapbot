@@ -15,6 +15,7 @@ from guapbot.cli.backtest_commands import backtest_app
 from guapbot.cli.data_commands import data_app
 from guapbot.cli.features_commands import features_app
 from guapbot.cli.model_commands import model_app
+from guapbot.cli.paper_commands import paper_app
 
 app = typer.Typer(
     name="guapbot",
@@ -28,6 +29,7 @@ app.add_typer(data_app, name="data")
 app.add_typer(features_app, name="features")
 app.add_typer(model_app, name="models")
 app.add_typer(backtest_app, name="backtest")
+app.add_typer(paper_app, name="paper")
 
 
 @app.command("train")
@@ -61,8 +63,22 @@ def version() -> None:
 
 @app.command()
 def status() -> None:
-    """Show system status (placeholder — full implementation in Session 7)."""
-    console.print("[yellow]Status command available from Session 7 (execution layer)[/yellow]")
+    """Show system status: Redis connection, trading mode, active models."""
+    from guapbot.utils.config import settings
+    from guapbot.execution.market_state import MarketState
+
+    mode_colour = "green" if settings.is_paper else "red"
+    console.print(f"  Trading mode : [{mode_colour}]{settings.trading_mode.upper()}[/{mode_colour}]")
+
+    state = MarketState()
+    state.connect()
+    redis_colour = "green" if state.connected else "red"
+    console.print(f"  Redis        : [{redis_colour}]{'connected' if state.connected else 'offline'}[/{redis_colour}]")
+
+    if state.connected:
+        keys = state.all_keys()
+        console.print(f"  State keys   : {len(keys)}")
+        state.disconnect()
 
 
 def main() -> None:
