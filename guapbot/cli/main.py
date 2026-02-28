@@ -10,6 +10,7 @@ import typer
 from rich.console import Console
 
 from guapbot.cli.data_commands import data_app
+from guapbot.cli.features_commands import features_app
 
 app = typer.Typer(
     name="guapbot",
@@ -20,6 +21,7 @@ console = Console()
 
 # Register sub-applications
 app.add_typer(data_app, name="data")
+app.add_typer(features_app, name="features")
 
 
 @app.command()
