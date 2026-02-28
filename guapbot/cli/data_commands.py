@@ -2,8 +2,8 @@
 guapbot/cli/data_commands.py
 
 Workflow:
-    1. guapbot data import --dir data/raw/master_q4   ← Kraken CSVs into Parquet
-    2. guapbot data download                           ← incremental updates from Kraken API
+    1. guapbot data import --dir data/raw/master_q4   ← Kraken quarterly CSVs into Parquet
+    2. guapbot data download                           ← backfill recent bars via tick API
     3. guapbot data info                               ← check what's cached
 """
 from __future__ import annotations
@@ -57,46 +57,55 @@ def import_csv(
 
 @data_app.command("download")
 def download(
-    pair: Optional[str] = typer.Argument(None, help="Pair to update. Omit for all."),
-    interval: Optional[str] = typer.Option(None, "--interval", "-i", help="1h, 4h, or 1d."),
+    pair: Optional[str] = typer.Argument(None, help="Pair to backfill. Omit for all."),
+    since: Optional[int] = typer.Option(
+        None,
+        "--since",
+        help=(
+            "Start nanosecond cursor. Defaults to resuming from the last cached bar. "
+            "Pass 0 to re-fetch from the very beginning (slow)."
+        ),
+    ),
 ) -> None:
-    """Incremental update from Kraken — fetches only new bars since last cache entry."""
+    """
+    Backfill bars from Kraken tick data, resuming from the last cached bar.
+
+    Fetches raw trades via GET /public/Trades, aggregates to 1h/4h/1d bars,
+    and appends new data to the local Parquet cache for all intervals at once.
+
+    Warning: first-time backfill of 2+ months of BTC ticks takes ~1 hour per pair.
+    Subsequent runs (incremental) are fast — only fetches ticks since the last bar.
+    """
     manager = DataManager()
     pairs = [pair.upper()] if pair else ALL_PAIRS
-    intervals = [interval] if interval else ALL_INTERVALS
 
     for p in pairs:
         if p not in ALL_PAIRS:
             console.print(f"[red]Unknown pair '{p}'. Valid: {ALL_PAIRS}[/red]")
             raise typer.Exit(1)
-    for iv in intervals:
-        if iv not in ALL_INTERVALS:
-            console.print(f"[red]Unknown interval '{iv}'. Valid: {ALL_INTERVALS}[/red]")
-            raise typer.Exit(1)
 
-    total = len(pairs) * len(intervals)
-    console.print(f"[bold]GuapBot Data Download[/bold] — updating {total} dataset(s) from Kraken")
+    console.print(f"[bold]GuapBot Data Download[/bold] — backfilling {len(pairs)} pair(s) from Kraken")
 
-    count = 0
     errors = 0
-    for p in pairs:
-        for iv in intervals:
-            count += 1
-            console.print(f"  [{count}/{total}] {p} {iv}...", end=" ")
-            try:
-                df = manager.fetch(p, iv)
-                console.print(
-                    f"[green]✓[/green] {len(df):,} bars total  "
-                    f"(latest: {df.index[-1].date()})"
-                )
-            except Exception as exc:
-                console.print(f"[red]✗ ERROR: {exc}[/red]")
-                errors += 1
+    for i, p in enumerate(pairs, 1):
+        console.print(f"\n  [{i}/{len(pairs)}] {p}...")
+        try:
+            kwargs = {"since": since} if since is not None else {}
+            results = manager.backfill_trades(p, **kwargs)
+            if results:
+                for iv, df in results.items():
+                    last = df.index[-1].date() if not df.empty else "N/A"
+                    console.print(f"    [green]✓[/green] {iv}: {len(df):,} bars cached  (latest: {last})")
+            else:
+                console.print(f"    [yellow]No new bars — cache already up to date.[/yellow]")
+        except Exception as exc:
+            console.print(f"    [red]✗ ERROR: {exc}[/red]")
+            errors += 1
 
     if errors:
         console.print(f"\n[yellow]Completed with {errors} error(s).[/yellow]")
     else:
-        console.print("\n[bold green]Update complete.[/bold green]")
+        console.print("\n[bold green]Download complete.[/bold green]")
     _print_cache_table(manager)
 
 
@@ -105,7 +114,7 @@ def fetch(
     pair: str = typer.Argument(..., help="Pair: XBTUSD, ETHUSD, ETHBTC"),
     interval: str = typer.Argument("1h", help="Interval: 1h, 4h, 1d"),
 ) -> None:
-    """Incremental update for a single pair/interval."""
+    """Show cached bars for a single pair/interval (reads cache only, no API call)."""
     manager = DataManager()
     console.print(f"Fetching {pair.upper()} {interval}...")
     try:

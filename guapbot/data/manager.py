@@ -98,7 +98,7 @@ class DataManager:
         results = self.backfill_trades(pair, since=0)
         return results.get(interval, pd.DataFrame())
 
-    def backfill_trades(self, pair: str, since: int = 0) -> dict[str, pd.DataFrame]:
+    def backfill_trades(self, pair: str, since: Optional[int] = None) -> dict[str, pd.DataFrame]:
         """
         Fetch all trades since `since` nanosecond cursor, aggregate to all intervals,
         and append to the store.
@@ -109,10 +109,12 @@ class DataManager:
 
         Args:
             pair:  One of XBTUSD, ETHUSD, ETHBTC.
-            since: Nanosecond cursor returned by a previous get_trades() call, or 0
-                   to start from the earliest trade available on Kraken.
-                   To convert from a Unix-second timestamp:
-                       since = int(last_bar_ts.timestamp()) * 1_000_000_000
+            since: Nanosecond cursor. Defaults to None — auto-resumes from the
+                   last cached 1h bar's timestamp. Pass 0 to start from the very
+                   beginning of Kraken's trade history (slow — full BTC history
+                   ≈ 10,000+ API pages ≈ 1 hour).
+                   To set a specific start point:
+                       since = int(unix_ts_seconds * 1_000_000_000)
 
         Returns:
             Dict of {interval: full_cached_DataFrame} for each interval that received
@@ -124,6 +126,15 @@ class DataManager:
         """
         if pair not in ALL_PAIRS:
             raise ValueError(f"Unknown pair '{pair}'. Valid: {ALL_PAIRS}")
+
+        if since is None:
+            last_ts = self._store.last_timestamp(pair, "1h")
+            if last_ts is not None:
+                since = int(last_ts.timestamp()) * 1_000_000_000
+                logger.info("Resuming %s from last cached bar: %s (cursor=%s)", pair, last_ts, since)
+            else:
+                since = 0
+                logger.info("No cache for %s — fetching from beginning of Kraken history", pair)
 
         logger.info("Starting trade backfill for %s (since cursor=%s)", pair, since)
 

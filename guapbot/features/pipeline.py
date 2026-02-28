@@ -112,7 +112,7 @@ class FeaturePipeline:
         Build complete normalised features for a pair from scratch.
 
         Steps:
-          1. Fetch raw OHLCV (incremental update via DataManager)
+          1. Load raw OHLCV from cache (run backfill_trades() first for recent bars)
           2. Build multi-timeframe indicators
           3. Inject ETHBTC cross-asset features (for traded pairs)
           4. Normalise (rolling z-score)
