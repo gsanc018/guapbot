@@ -11,6 +11,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from guapbot.cli.backtest_commands import backtest_app
 from guapbot.cli.data_commands import data_app
 from guapbot.cli.features_commands import features_app
 from guapbot.cli.model_commands import model_app
@@ -26,6 +27,7 @@ console = Console()
 app.add_typer(data_app, name="data")
 app.add_typer(features_app, name="features")
 app.add_typer(model_app, name="models")
+app.add_typer(backtest_app, name="backtest")
 
 
 @app.command("train")

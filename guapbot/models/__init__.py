@@ -2,6 +2,10 @@
 
 from guapbot.models.base import BaseModel, ModelMetadata
 from guapbot.models.ensemble import BaseEnsemble, EnsembleInput, ModelSignal, TradeOutcome
+try:
+    from guapbot.models.ensemble_lightgbm import EnsembleLearner
+except Exception:
+    EnsembleLearner = None  # type: ignore[assignment,misc]
 from guapbot.models.gradient_boost import GradientBoost
 from guapbot.models.lstm import LSTMModel
 from guapbot.models.mean_reversion import MeanReversion
@@ -15,6 +19,7 @@ __all__ = [
     "EnsembleInput",
     "ModelSignal",
     "TradeOutcome",
+    "EnsembleLearner",
     "TrendFollowing",
     "MeanReversion",
     "GradientBoost",
