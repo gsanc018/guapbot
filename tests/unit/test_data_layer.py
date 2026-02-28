@@ -50,7 +50,7 @@ def tmp_store(tmp_path: Path) -> ParquetStore:
 def mock_client() -> MagicMock:
     """KrakenClient with mocked get_ohlc."""
     client = MagicMock(spec=KrakenClient)
-    client.get_ohlc.return_value = make_ohlc_df(50)
+    client.get_ohlc.return_value = (make_ohlc_df(50), 1234567890)
     client.get_ticker.return_value = {"ask": 50100.0, "bid": 49900.0, "last": 50000.0, "volume_24h": 1234.0}
     return client
 
@@ -88,13 +88,14 @@ class TestKrakenClient:
             mock_resp.raise_for_status.return_value = None
             mock_get.return_value = mock_resp
 
-            df = client.get_ohlc("XBTUSD", "1h")
+            df, last_cursor = client.get_ohlc("XBTUSD", "1h")
 
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 5
         assert list(df.columns) == ["open", "high", "low", "close", "volume", "trades"]
         assert isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None  # UTC-aware
         assert df.index.is_monotonic_increasing
+        assert last_cursor == now
 
     def test_get_ohlc_invalid_interval_raises(self) -> None:
         client = KrakenClient()
@@ -210,8 +211,9 @@ class TestDataManager:
             nonlocal call_count
             call_count += 1
             if call_count > 2:
-                return pd.DataFrame()
-            return make_ohlc_df(50, start="2024-01-01")
+                return pd.DataFrame(), since or 0
+            next_cursor = (since or 0) + 1
+            return make_ohlc_df(50, start="2024-01-01"), next_cursor
 
         mock_client.get_ohlc.side_effect = side_effect
         df = manager.fetch("XBTUSD", "1h")
@@ -227,7 +229,7 @@ class TestDataManager:
 
         # Fetch should now do incremental — single call with since set
         new_bars = make_ohlc_df(5, start="2024-01-05 04:00")
-        mock_client.get_ohlc.return_value = new_bars
+        mock_client.get_ohlc.return_value = (new_bars, 1234567890)
 
         df = manager.fetch("XBTUSD", "1h")
         call_args = mock_client.get_ohlc.call_args

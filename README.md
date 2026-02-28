@@ -19,8 +19,8 @@ cp .env.example .env   # fill in your keys
 ## Run Tests
 
 ```bash
-./run_tests.sh
-# or: python3 -m unittest discover -s tests/unit -v
+.venv/bin/pytest tests/unit -v
+# or: ./run_tests.sh
 ```
 
 ## Architecture
@@ -38,4 +38,4 @@ cp .env.example .env   # fill in your keys
 ## Build Sessions
 
 See `guapbot_handoff.docx` for the complete 14-session build spec.
-Current: **Session 1 complete** (foundation layer).
+Current: **Session 2 complete** (foundation + data layer).
