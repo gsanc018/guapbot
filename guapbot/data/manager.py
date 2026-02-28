@@ -5,14 +5,15 @@ DataManager: high-level interface for all price data access.
 This is what every other layer calls — never KrakenClient or ParquetStore directly.
 
 Public API:
-    manager.fetch(pair, interval)           → DataFrame from cache (CSV-imported data)
-    manager.full_history(pair, interval)    → TODO: backfill via GET /public/Trades
-    manager.latest_price(pair)              → float (REST ticker)
-    manager.available_pairs()              → list of valid pair strings
-    manager.cache_info()                    → dict summary of what's cached
+    manager.fetch(pair, interval)              → DataFrame from cache (CSV-imported data)
+    manager.full_history(pair, interval)       → backfill all history via GET /public/Trades
+    manager.backfill_trades(pair, since)       → incremental backfill from a nanosecond cursor
+    manager.latest_price(pair)                 → float (REST ticker)
+    manager.available_pairs()                  → list of valid pair strings
+    manager.cache_info()                       → dict summary of what's cached
 
 Historical data is loaded via KrakenCSVImporter (guapbot/data/importer.py).
-Backfilling recent bars (2026 onwards) requires GET /public/Trades — see full_history().
+Backfilling recent bars (2026 onwards) uses backfill_trades() / full_history().
 """
 from __future__ import annotations
 
@@ -31,6 +32,14 @@ logger = get_logger(__name__)
 # All pairs and intervals GuapBot uses
 ALL_PAIRS = ["XBTUSD", "ETHUSD", "ETHBTC"]
 ALL_INTERVALS = ["1h", "4h", "1d"]
+
+# Flush to store every this many pages during backfill (~200k ticks, ~28h of BTC trades).
+# Keeps peak memory to ~100 MB instead of accumulating all ticks at once.
+_BACKFILL_CHUNK_PAGES = 200
+
+# Hours of ticks to carry forward across flushes.
+# Must be > max interval (1d = 24h) to avoid splitting daily bars at a flush boundary.
+_BACKFILL_BAR_BUFFER_H = 25
 
 
 class DataManager:
@@ -59,15 +68,14 @@ class DataManager:
         Return the cached DataFrame for pair/interval.
 
         Historical data is loaded into the cache via KrakenCSVImporter.
-        Incremental updates (new bars since the last cached timestamp) are not
-        yet implemented — see full_history() for the planned approach.
+        For recent bars not yet in the CSV, call backfill_trades() first.
 
-        TODO: once get_trades() is implemented, add an incremental update step:
+        TODO: wire incremental updates when BarBuilder is implemented (Session 7+):
             last_ts = self._store.last_timestamp(pair, interval)
             if last_ts is not None:
-                new_bars = aggregate_trades(
-                    self._client.get_trades(pair, since=last_ts_nanoseconds)
-                )
+                since_ns = int(last_ts.timestamp()) * 1_000_000_000
+                rows, _ = self._client.get_trades(pair, since=since_ns)
+                new_bars = aggregate_trades_to_ohlcv(rows_to_tick_df(rows), interval)
                 return self._store.append(pair, interval, new_bars)
         """
         self._validate(pair, interval)
@@ -80,41 +88,24 @@ class DataManager:
 
     def full_history(self, pair: str, interval: str = "1h") -> pd.DataFrame:
         """
-        Backfill ALL history for pair/interval using raw tick data.
+        Download full tick history for pair from the beginning of Kraken's records,
+        aggregate to the requested interval, and return the cached DataFrame.
 
-        The GET /public/OHLC endpoint is limited to ~720 bars and is unreliable
-        for full history. Use GET /public/Trades instead, which returns all ticks
-        and can be paginated from the beginning to now.
-
-        TODO: implement using KrakenClient.get_trades():
-            since = 0
-            all_rows = []
-            while True:
-                rows, last = self._client.get_trades(pair=pair, since=since)
-                if not rows:
-                    break
-                all_rows.extend(rows)
-                if str(last) == str(since):   # stalled
-                    break
-                since = last
-            Then resample all_rows → OHLCV time bars for each interval and save
-            via self._store.save(). Each tick row from Kraken is:
-            [price, volume, time, buy_sell, market_limit, misc, trade_id]
-            Use pd.DataFrame(all_rows).resample(interval).agg({...}) to create bars.
-
-        For now, historical data is available via KrakenCSVImporter (CSV files
-        cover from coin inception through 2025-12-31).
+        This is a wrapper around backfill_trades(since=0). Expects to run for
+        several hours per pair (BTC full history ≈ 10M+ trades).
         """
-        raise NotImplementedError(
-            "full_history() via trades not yet implemented. "
-            "Load historical CSV data with KrakenCSVImporter. "
-            "See the docstring for the get_trades() backfill pattern."
-        )
+        self._validate(pair, interval)
+        results = self.backfill_trades(pair, since=0)
+        return results.get(interval, pd.DataFrame())
 
     def backfill_trades(self, pair: str, since: int = 0) -> dict[str, pd.DataFrame]:
         """
         Fetch all trades since `since` nanosecond cursor, aggregate to all intervals,
         and append to the store.
+
+        Memory-safe: flushes completed bars to disk every _BACKFILL_CHUNK_PAGES pages
+        (~200k ticks) and retains only the last _BACKFILL_BAR_BUFFER_H hours of ticks
+        in memory to protect against incomplete bars at flush boundaries.
 
         Args:
             pair:  One of XBTUSD, ETHUSD, ETHBTC.
@@ -136,9 +127,42 @@ class DataManager:
 
         logger.info("Starting trade backfill for %s (since cursor=%s)", pair, since)
 
-        all_rows: list = []
+        pending: list = []   # ticks not yet flushed to disk
         cursor = since
         page = 0
+        total_ticks = 0
+        results: dict[str, pd.DataFrame] = {}
+
+        def _flush(is_final: bool) -> None:
+            nonlocal pending
+            if not pending:
+                return
+
+            ticks = rows_to_tick_df(pending)
+            last_ts = ticks["timestamp"].max()
+
+            for interval in ALL_INTERVALS:
+                bars = aggregate_trades_to_ohlcv(ticks, interval)
+                if bars.empty:
+                    continue
+
+                if not is_final:
+                    # Only save bars that closed > _BACKFILL_BAR_BUFFER_H hours before
+                    # the last tick, so we never save a bar that still has incoming ticks.
+                    safe_cutoff = last_ts - pd.Timedelta(hours=_BACKFILL_BAR_BUFFER_H)
+                    bars = bars[bars.index < safe_cutoff]
+
+                if bars.empty:
+                    continue
+
+                merged = self._store.append(pair, interval, bars)
+                results[interval] = merged
+
+            if not is_final:
+                # Retain the most recent _BACKFILL_BAR_BUFFER_H hours of ticks so the
+                # next chunk can complete any bar that straddles the flush boundary.
+                cutoff_unix = (last_ts - pd.Timedelta(hours=_BACKFILL_BAR_BUFFER_H)).timestamp()
+                pending = [r for r in pending if float(r[2]) >= cutoff_unix]
 
         while True:
             rows, last = self._client.get_trades(pair=pair, since=cursor)
@@ -146,13 +170,15 @@ class DataManager:
                 logger.info("No trades returned — backfill complete for %s", pair)
                 break
 
-            all_rows.extend(rows)
+            pending.extend(rows)
+            total_ticks += len(rows)
             page += 1
 
-            if page % 100 == 0:
+            if page % _BACKFILL_CHUNK_PAGES == 0:
+                _flush(is_final=False)
                 logger.info(
-                    "  %s: page %d, %d ticks accumulated (cursor=%s)",
-                    pair, page, len(all_rows), cursor,
+                    "  %s: page %d, %d total ticks, ~%d ticks in buffer",
+                    pair, page, total_ticks, len(pending),
                 )
 
             if str(last) == str(cursor):
@@ -162,26 +188,15 @@ class DataManager:
             cursor = last
             time.sleep(0.34)  # ~3 req/s — stay within Kraken public rate limit
 
-        logger.info("Fetched %d total ticks for %s (%d pages)", len(all_rows), pair, page)
+        _flush(is_final=True)
 
-        if not all_rows:
+        if not results:
             logger.warning("No trades fetched for %s — store unchanged", pair)
             return {}
 
-        ticks = rows_to_tick_df(all_rows)
-        results: dict[str, pd.DataFrame] = {}
-
-        for interval in ALL_INTERVALS:
-            bars = aggregate_trades_to_ohlcv(ticks, interval)
-            if bars.empty:
-                logger.warning("No %s bars aggregated for %s", interval, pair)
-                continue
-            merged = self._store.append(pair, interval, bars)
-            results[interval] = merged
-            logger.info(
-                "  %s %s: +%d new bars appended (total cached: %d)",
-                pair, interval, len(bars), len(merged),
-            )
+        logger.info("Backfill complete for %s: %d ticks, %d pages", pair, total_ticks, page)
+        for interval, df in results.items():
+            logger.info("  %s %s: %d total bars cached", pair, interval, len(df))
 
         return results
 
@@ -208,13 +223,20 @@ class DataManager:
         """
         Download full history for all pairs and all intervals.
         Called by: guapbot data download
-
-        TODO: implement once full_history() / get_trades() is ready.
-        For now, load historical data with KrakenCSVImporter.
         """
-        raise NotImplementedError(
-            "download_all() not yet implemented — see full_history() for the plan."
-        )
+        logger.info("Starting full data download for all pairs and intervals...")
+        total = len(ALL_PAIRS) * len(ALL_INTERVALS)
+        count = 0
+        for pair in ALL_PAIRS:
+            count += 1
+            logger.info("[%d/%d] %s", count, total, pair)
+            try:
+                results = self.backfill_trades(pair, since=0)
+                for interval, df in results.items():
+                    logger.info("  %s %s: %d bars", pair, interval, len(df))
+            except Exception as exc:
+                logger.error("  %s failed: %s", pair, exc)
+        logger.info("Download complete.")
 
     # ------------------------------------------------------------------
     # Internal

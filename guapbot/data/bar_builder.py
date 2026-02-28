@@ -67,10 +67,11 @@ class BarBuilder:
                           bar.name = bar open timestamp (UTC-aware pd.Timestamp)
                           bar columns: open, high, low, close, volume, trades
         """
-        raise NotImplementedError(
-            "BarBuilder not yet implemented — needed for live trading (Session 7+). "
-            "See module docstring for implementation guidance."
-        )
+        self.interval = interval
+        self._on_bar_close = on_bar_close
+        # TODO: initialize per-pair state dict when implementing (Session 7+):
+        # self._state: dict[str, _BarState] = {}
+        # where _BarState holds: open, high, low, close, volume, trades, bar_open_ts
 
     async def on_trade(self, pair: str, trade: dict) -> None:
         """

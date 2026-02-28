@@ -194,6 +194,6 @@ class KrakenClient:
                 if attempt == 2:
                     raise KrakenRESTError(f"Request failed after 3 attempts: {exc}") from exc
                 wait = 2 ** attempt
-                logger.warning(f"Kraken request failed (attempt {attempt+1}), retrying in {wait}s")
+                logger.warning("Kraken request failed (attempt %d/3), retrying in %ds", attempt + 1, wait)
                 time.sleep(wait)
         raise KrakenRESTError("Unreachable")
